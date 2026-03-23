@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "02-crud-operations",
+    "03-token-operations",
+    "04-nft-operations",
+    "05-auth-patterns",
+    "10-events-and-logging",
+    "11-storage-patterns",
+    "12-cross-contract",
+]
+
+[workspace.dependencies]
+soroban-sdk = "22"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
