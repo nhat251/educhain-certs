@@ -1,289 +1,310 @@
 #![no_std]
 
-use core::option::Option;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec,
 };
-
-const DAY_IN_LEDGERS: u32 = 17_280;
-const INSTANCE_TTL: u32 = 7 * DAY_IN_LEDGERS;
-const INSTANCE_THRESHOLD: u32 = 6 * DAY_IN_LEDGERS;
-const CERT_TTL: u32 = 365 * DAY_IN_LEDGERS;
-const CERT_THRESHOLD: u32 = 364 * DAY_IN_LEDGERS;
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    NextCertId,
-    Cert(u64),
-    WalletCerts(Address),
-}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Certificate {
     pub id: u64,
-    pub student: Address,
-    pub cert_hash: String,
+    pub owner: Address,
     pub course_name: String,
-    pub issuer_name: String,
+    pub issuer: Address,
     pub issued_at: u64,
     pub revoked: bool,
-    pub revoked_reason: Option<String>,
-    pub revoked_at: Option<u64>,
+}
+
+#[contracttype]
+pub enum DataKey {
+    Admin,
+    NextCertificateId,
+    Certificate(u64),
+    OwnerCertificates(Address),
 }
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum CertError {
-    NotAdmin = 1,
-    CertNotFound = 2,
-    AlreadyRevoked = 3,
-    SoulboundNonTransferable = 4,
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    NotAdmin = 3,
+    CertificateNotFound = 4,
+    NotTransferable = 5,
 }
 
 #[contract]
-pub struct EduChainCerts;
+pub struct EduChainsCertsContract;
 
 #[contractimpl]
-impl EduChainCerts {
-    pub fn __constructor(env: Env, admin: Address) {
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::NextCertId, &0_u64);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_THRESHOLD, INSTANCE_TTL);
-    }
-
-    pub fn admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
-    }
-
-    pub fn issue_cert(
-        env: Env,
-        issuer: Address,
-        student: Address,
-        cert_hash: String,
-        course_name: String,
-        issuer_name: String,
-    ) -> Result<u64, CertError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if issuer != admin {
-            return Err(CertError::NotAdmin);
+impl EduChainsCertsContract {
+    // One-time setup: store the institution admin address.
+    pub fn init(env: Env, admin: Address) -> Result<(), CertError> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(CertError::AlreadyInitialized);
         }
-        issuer.require_auth();
 
-        let cert_id: u64 = env.storage().instance().get(&DataKey::NextCertId).unwrap_or(0) + 1;
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::NextCertificateId, &1_u64);
+        Ok(())
+    }
+
+    // Admin issues a new non-transferable certificate to a student wallet.
+    pub fn issue_certificate(
+        env: Env,
+        caller: Address,
+        owner: Address,
+        course_name: String,
+        issued_at: u64,
+    ) -> Result<u64, CertError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+
+        let id = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::NextCertificateId)
+            .ok_or(CertError::NotInitialized)?;
+
         let cert = Certificate {
-            id: cert_id,
-            student: student.clone(),
-            cert_hash,
+            id,
+            owner: owner.clone(),
             course_name,
-            issuer_name,
-            issued_at: env.ledger().timestamp(),
+            issuer: caller,
+            issued_at,
             revoked: false,
-            revoked_reason: Option::None,
-            revoked_at: Option::None,
         };
 
-        env.storage().persistent().set(&DataKey::Cert(cert_id), &cert);
+        env.storage().persistent().set(&DataKey::Certificate(id), &cert);
 
-        let mut ids: Vec<u64> = env
+        let mut owner_ids = env
             .storage()
             .persistent()
-            .get(&DataKey::WalletCerts(student.clone()))
+            .get::<DataKey, Vec<u64>>(&DataKey::OwnerCertificates(owner.clone()))
             .unwrap_or(Vec::new(&env));
-        ids.push_back(cert_id);
+        owner_ids.push_back(id);
         env.storage()
             .persistent()
-            .set(&DataKey::WalletCerts(student.clone()), &ids);
+            .set(&DataKey::OwnerCertificates(owner), &owner_ids);
 
-        env.storage().instance().set(&DataKey::NextCertId, &cert_id);
-
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Cert(cert_id), CERT_THRESHOLD, CERT_TTL);
-        env.storage().persistent().extend_ttl(
-            &DataKey::WalletCerts(student.clone()),
-            CERT_THRESHOLD,
-            CERT_TTL,
-        );
         env.storage()
             .instance()
-            .extend_ttl(INSTANCE_THRESHOLD, INSTANCE_TTL);
+            .set(&DataKey::NextCertificateId, &(id + 1));
 
-        env.events()
-            .publish((symbol_short!("issued"), student, cert_id), true);
-
-        Ok(cert_id)
+        Ok(id)
     }
 
-    pub fn verify_by_id(env: Env, cert_id: u64) -> Result<Certificate, CertError> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Cert(cert_id))
-            .ok_or(CertError::CertNotFound)
-    }
-
-    pub fn certs_of_wallet(env: Env, student: Address) -> Vec<u64> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::WalletCerts(student))
-            .unwrap_or(Vec::new(&env))
-    }
-
-    pub fn revoke(
-        env: Env,
-        issuer: Address,
-        cert_id: u64,
-        reason: String,
-    ) -> Result<(), CertError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if issuer != admin {
-            return Err(CertError::NotAdmin);
-        }
-        issuer.require_auth();
+    // Admin can revoke a certificate (soft delete by status flag).
+    pub fn revoke_certificate(env: Env, caller: Address, certificate_id: u64) -> Result<(), CertError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
 
         let mut cert: Certificate = env
             .storage()
             .persistent()
-            .get(&DataKey::Cert(cert_id))
-            .ok_or(CertError::CertNotFound)?;
-
-        if cert.revoked {
-            return Err(CertError::AlreadyRevoked);
-        }
+            .get(&DataKey::Certificate(certificate_id))
+            .ok_or(CertError::CertificateNotFound)?;
 
         cert.revoked = true;
-        cert.revoked_reason = Option::Some(reason);
-        cert.revoked_at = Option::Some(env.ledger().timestamp());
-
-        env.storage().persistent().set(&DataKey::Cert(cert_id), &cert);
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Cert(cert_id), CERT_THRESHOLD, CERT_TTL);
-
-        env.events()
-            .publish((symbol_short!("revoked"), cert.student, cert_id), true);
+            .set(&DataKey::Certificate(certificate_id), &cert);
 
         Ok(())
     }
 
-    pub fn transfer(
-        _env: Env,
-        _from: Address,
+    // Anyone can verify whether a certificate exists and is not revoked.
+    pub fn verify_certificate(env: Env, certificate_id: u64) -> bool {
+        let cert: Option<Certificate> = env.storage().persistent().get(&DataKey::Certificate(certificate_id));
+        match cert {
+            Some(c) => !c.revoked,
+            None => false,
+        }
+    }
+
+    // Return full certificate records owned by a student wallet.
+    pub fn get_certificates_by_owner(env: Env, owner: Address) -> Vec<Certificate> {
+        let ids = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&DataKey::OwnerCertificates(owner))
+            .unwrap_or(Vec::new(&env));
+
+        let mut certs = Vec::new(&env);
+        for id in ids.iter() {
+            let cert: Certificate = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Certificate(id))
+                .unwrap();
+            certs.push_back(cert);
+        }
+
+        certs
+    }
+
+    // Helper reader for frontends/explorers that need full certificate details by id.
+    pub fn get_certificate(env: Env, certificate_id: u64) -> Result<Certificate, CertError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Certificate(certificate_id))
+            .ok_or(CertError::CertificateNotFound)
+    }
+
+    // Soulbound guarantee: transfer is permanently blocked.
+    pub fn transfer_certificate(
+        env: Env,
+        _caller: Address,
         _to: Address,
-        _cert_id: u64,
+        _certificate_id: u64,
     ) -> Result<(), CertError> {
-        Err(CertError::SoulboundNonTransferable)
+        let _ = env;
+        Err(CertError::NotTransferable)
+    }
+
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), CertError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(CertError::NotInitialized)?;
+
+        if &admin != caller {
+            return Err(CertError::NotAdmin);
+        }
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env, String};
+    use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
-    fn setup() -> (Env, EduChainCertsClient<'static>, Address, Address) {
+    fn setup() -> (
+        Env,
+        EduChainsCertsContractClient<'static>,
+        Address,
+        Address,
+        Address,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
 
+        let contract_id = env.register(EduChainsCertsContract, ());
+        let client = EduChainsCertsContractClient::new(&env, &contract_id);
+
         let admin = Address::generate(&env);
         let student = Address::generate(&env);
+        let stranger = Address::generate(&env);
 
-        let contract_id = env.register(EduChainCerts, EduChainCertsArgs::__constructor(&admin));
-        let client = EduChainCertsClient::new(&env, &contract_id);
+        client.init(&admin);
 
-        (env, client, admin, student)
+        (env, client, admin, student, stranger)
     }
 
     #[test]
-    fn issue_and_verify_by_id() {
-        let (env, client, admin, student) = setup();
+    fn issuing_a_certificate_works() {
+        let (env, client, admin, student, _) = setup();
 
-        let cert_id = client.issue_cert(
+        let cert_id = client.issue_certificate(
             &admin,
             &student,
-            &String::from_str(&env, "QmHash123"),
             &String::from_str(&env, "Soroban Bootcamp"),
-            &String::from_str(&env, "EduChain University"),
+            &1_710_000_000_u64,
         );
 
         assert_eq!(cert_id, 1);
 
-        let cert = client.verify_by_id(&cert_id);
-        assert_eq!(cert.student, student);
+        let cert = client.get_certificate(&cert_id);
+        assert_eq!(cert.id, 1);
+        assert_eq!(cert.owner, student.clone());
+        assert_eq!(cert.course_name, String::from_str(&env, "Soroban Bootcamp"));
+        assert_eq!(cert.issuer, admin.clone());
+        assert_eq!(cert.issued_at, 1_710_000_000_u64);
         assert_eq!(cert.revoked, false);
+
+        let by_owner = client.get_certificates_by_owner(&student);
+        assert_eq!(by_owner.len(), 1);
+        assert_eq!(by_owner.get(0).unwrap().id, cert_id);
     }
 
     #[test]
-    fn issue_fails_for_non_admin() {
-        let (env, client, _admin, student) = setup();
-        let attacker = Address::generate(&env);
+    fn revoking_a_certificate_works() {
+        let (env, client, admin, student, _) = setup();
 
-        let result = client.try_issue_cert(
-            &attacker,
-            &student,
-            &String::from_str(&env, "QmFake"),
-            &String::from_str(&env, "Fake Course"),
-            &String::from_str(&env, "Fake Issuer"),
-        );
-
-        assert_eq!(result, Err(Ok(CertError::NotAdmin)));
-    }
-
-    #[test]
-    fn verify_by_wallet_returns_ids() {
-        let (env, client, admin, student) = setup();
-
-        let cert_id = client.issue_cert(
+        let cert_id = client.issue_certificate(
             &admin,
             &student,
-            &String::from_str(&env, "QmHashABC"),
-            &String::from_str(&env, "Blockchain 101"),
-            &String::from_str(&env, "EduChain University"),
+            &String::from_str(&env, "Rust 101"),
+            &1_710_000_001_u64,
         );
 
-        let ids = client.certs_of_wallet(&student);
-        assert_eq!(ids.len(), 1);
-        assert_eq!(ids.get(0).unwrap(), cert_id);
+        assert_eq!(client.verify_certificate(&cert_id), true);
+
+        client.revoke_certificate(&admin, &cert_id);
+
+        assert_eq!(client.verify_certificate(&cert_id), false);
+        assert_eq!(client.get_certificate(&cert_id).revoked, true);
     }
 
     #[test]
-    fn revoke_updates_certificate_status() {
-        let (env, client, admin, student) = setup();
+    fn verifying_certificate_validity_works() {
+        let (env, client, admin, student, _) = setup();
 
-        let cert_id = client.issue_cert(
+        let valid_id = client.issue_certificate(
             &admin,
             &student,
-            &String::from_str(&env, "QmHashREVOKE"),
-            &String::from_str(&env, "Security Basics"),
-            &String::from_str(&env, "EduChain University"),
+            &String::from_str(&env, "Blockchain Fundamentals"),
+            &1_710_000_002_u64,
         );
 
-        client.revoke(&admin, &cert_id, &String::from_str(&env, "Academic misconduct"));
-
-        let cert = client.verify_by_id(&cert_id);
-        assert_eq!(cert.revoked, true);
-        assert!(cert.revoked_reason.is_some());
+        assert_eq!(client.verify_certificate(&valid_id), true);
+        assert_eq!(client.verify_certificate(&999_u64), false);
     }
 
     #[test]
-    fn transfer_is_always_blocked_for_soulbound() {
-        let (env, client, admin, student) = setup();
-        let other = Address::generate(&env);
+    fn preventing_unauthorized_actions_works() {
+        let (env, client, admin, student, stranger) = setup();
 
-        let cert_id = client.issue_cert(
+        let issue_result = client.try_issue_certificate(
+            &stranger,
+            &student,
+            &String::from_str(&env, "Unauthorized Course"),
+            &1_710_000_003_u64,
+        );
+        assert_eq!(issue_result, Err(Ok(CertError::NotAdmin)));
+
+        let cert_id = client.issue_certificate(
             &admin,
             &student,
-            &String::from_str(&env, "QmHashSoul"),
-            &String::from_str(&env, "Web3 Fundamentals"),
-            &String::from_str(&env, "EduChain University"),
+            &String::from_str(&env, "Authorized Course"),
+            &1_710_000_004_u64,
         );
 
-        let result = client.try_transfer(&student, &other, &cert_id);
-        assert_eq!(result, Err(Ok(CertError::SoulboundNonTransferable)));
+        let revoke_result = client.try_revoke_certificate(&stranger, &cert_id);
+        assert_eq!(revoke_result, Err(Ok(CertError::NotAdmin)));
+
+        assert_eq!(client.verify_certificate(&cert_id), true);
+    }
+
+    #[test]
+    fn transfer_is_blocked_for_soulbound_behavior() {
+        let (env, client, admin, student, stranger) = setup();
+
+        let cert_id = client.issue_certificate(
+            &admin,
+            &student,
+            &String::from_str(&env, "Web3 Identity"),
+            &1_710_000_005_u64,
+        );
+
+        let transfer_result = client.try_transfer_certificate(&stranger, &student, &cert_id);
+        assert_eq!(transfer_result, Err(Ok(CertError::NotTransferable)));
+
+        let cert = client.get_certificate(&cert_id);
+        assert_eq!(cert.owner, student);
     }
 }
