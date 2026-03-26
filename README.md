@@ -1,3 +1,6 @@
+<img width="1910" height="995" alt="image" src="https://github.com/user-attachments/assets/d7092648-c630-402e-ac09-be6d44158992" />
+
+
 # Edu
 
 Edu is a Soroban smart contract project for issuing verifiable on-chain certificates on Stellar. The contract models certificates as soulbound records: institutions can issue and revoke them, anyone can verify them, and transfer is permanently blocked.
